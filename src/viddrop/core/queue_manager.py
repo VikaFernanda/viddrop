@@ -8,7 +8,6 @@ network or subprocess work itself.
 
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,6 +18,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from viddrop.core.database import DatabaseManager
 from viddrop.utils.logger import log
+from viddrop.utils.sanitize import sanitize_error
 
 
 def _utcnow_iso() -> str:
@@ -59,17 +59,6 @@ class QueueManager(QObject):
     error_occurred = pyqtSignal(str, str)  # (id, sanitized_message)
     download_completed = pyqtSignal(str)  # (id,)
     download_ready = pyqtSignal(str)  # (id,)
-
-    # Regex patterns whose matches are replaced with "<redacted>" before any
-    # error message is stored, logged, or emitted.
-    _REDACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
-        re.compile(r"Authorization:[^\r\n]+"),
-        re.compile(r"--password\s+\S+"),
-        re.compile(r"--username\s+\S+"),
-        re.compile(r"(?i)cookies?:\s*\S+"),
-        re.compile(r"(?:token|key|secret)=[A-Za-z0-9+/=]{8,}"),
-        re.compile(r"password=\S+"),
-    )
 
     def __init__(self, db: DatabaseManager | None = None) -> None:
         super().__init__()
@@ -209,7 +198,7 @@ class QueueManager(QObject):
     def mark_error(self, download_id: str, raw_message: str) -> None:
         """Mark a download as errored with a sanitized message."""
         entry = self._get_or_raise(download_id)
-        sanitized = self._sanitize_error(raw_message)
+        sanitized = sanitize_error(raw_message)
         entry.status = "error"
         entry.error_message = sanitized
         self._db.update_error(download_id, "error", sanitized)
@@ -270,13 +259,3 @@ class QueueManager(QObject):
             raise ValueError(f"Unknown download id: {download_id!r}")
         return self._entries[download_id]
 
-    @staticmethod
-    def _sanitize_error(raw: str) -> str:
-        """Redact credential-like patterns and bound the message length."""
-        cleaned = raw
-        for pattern in QueueManager._REDACTION_PATTERNS:
-            cleaned = pattern.sub("<redacted>", cleaned)
-        cleaned = cleaned[:500].strip()
-        if not cleaned:
-            return "Unknown error"
-        return cleaned
