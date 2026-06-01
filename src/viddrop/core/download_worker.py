@@ -65,7 +65,7 @@ class DownloadWorker(QRunnable):
             return
 
         try:
-            self._downloader.start(
+            output_path = self._downloader.start(
                 entry.url,
                 entry.destination_path,
                 credentials,
@@ -80,6 +80,7 @@ class DownloadWorker(QRunnable):
             self._queue_manager.mark_error(download_id, str(exc))
             return
 
+        self._queue_manager.set_output_path(download_id, output_path)
         self._queue_manager.mark_complete(download_id)
 
     def cancel(self) -> None:

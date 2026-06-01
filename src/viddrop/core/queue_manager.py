@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -19,6 +20,9 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from viddrop.core.database import DatabaseManager
 from viddrop.utils.logger import log
 from viddrop.utils.sanitize import sanitize_error
+
+if TYPE_CHECKING:
+    from viddrop.core.converter import ConversionSettings
 
 
 def _utcnow_iso() -> str:
@@ -44,6 +48,10 @@ class DownloadEntry:
     created_at: str = field(default_factory=_utcnow_iso)
     started_at: str | None = None
     completed_at: str | None = None
+    output_file_path: str | None = None
+    conversion_settings: ConversionSettings | None = field(
+        default=None, repr=False
+    )
 
 
 class QueueManager(QObject):
@@ -59,6 +67,11 @@ class QueueManager(QObject):
     error_occurred = pyqtSignal(str, str)  # (id, sanitized_message)
     download_completed = pyqtSignal(str)  # (id,)
     download_ready = pyqtSignal(str)  # (id,)
+    conversion_progress = pyqtSignal(str, float)  # (id, percent)
+    conversion_finished = pyqtSignal(str, str)  # (id, output_path)
+    conversion_failed = pyqtSignal(str, str)  # (id, sanitized_message)
+    conversion_cancelled = pyqtSignal(str)  # (id,)
+    conversion_needs_reselect = pyqtSignal(str, str)  # (id, max_resolution)
 
     def __init__(self, db: DatabaseManager | None = None) -> None:
         super().__init__()
@@ -66,6 +79,9 @@ class QueueManager(QObject):
         self._db.open()
         self._entries: dict[str, DownloadEntry] = {}
         self._dispatching: bool = False
+
+        # When a download finishes, hand it off to a conversion worker.
+        self.download_completed.connect(self._on_download_completed)
 
         for entry in self._db.load_all():
             self._entries[entry.id] = entry
@@ -159,7 +175,10 @@ class QueueManager(QObject):
             raise ValueError(
                 f"Cannot delete download {download_id!r}: status is {entry.status!r}"
             )
-        raw_path = Path(entry.destination_path)
+        # Prefer the resolved output file; fall back to destination_path only if
+        # output_file_path was never populated (e.g. entry loaded from DB after
+        # a crash before set_output_path was called).
+        raw_path = Path(entry.output_file_path or entry.destination_path)
         # Check for a symlink on the unresolved path: resolve() would follow
         # the link and make this guard a no-op, so we must test first.
         if raw_path.is_symlink():
@@ -175,6 +194,12 @@ class QueueManager(QObject):
         self._db.delete_download(download_id)
         del self._entries[download_id]
         log.info("Download deleted from storage: id=%s", download_id)
+
+    def set_output_path(self, download_id: str, file_path: str) -> None:
+        """Store the resolved output file path produced by the downloader."""
+        entry = self._get_or_raise(download_id)
+        entry.output_file_path = file_path
+        log.debug("Output file path set: id=%s", download_id)
 
     def update_progress(self, download_id: str, percent: int) -> None:
         """Update progress in memory and DB. Emits no signal."""
@@ -258,4 +283,70 @@ class QueueManager(QObject):
         if download_id not in self._entries:
             raise ValueError(f"Unknown download id: {download_id!r}")
         return self._entries[download_id]
+
+    # ------------------------------------------------------------------ #
+    # Conversion handoff
+    # ------------------------------------------------------------------ #
+
+    def _on_download_completed(self, download_id: str) -> None:
+        """Enqueue a conversion worker for a freshly completed download."""
+        from PyQt6.QtCore import QThreadPool
+
+        from viddrop.core.conversion_worker import ConversionWorker
+
+        entry = self._entries.get(download_id)
+        if entry is None:
+            log.warning("_on_download_completed: unknown id=%s", download_id)
+            return
+        if entry.output_file_path is None:
+            log.warning(
+                "_on_download_completed: no output_file_path for id=%s",
+                download_id,
+            )
+            return
+        worker = ConversionWorker(
+            download_id=download_id,
+            input_path=entry.output_file_path,
+            settings=entry.conversion_settings,
+        )
+        # Connect signals before starting the worker.
+        worker.signals.conversion_progress.connect(self._on_conversion_progress)
+        worker.signals.conversion_finished.connect(self._on_conversion_finished)
+        worker.signals.conversion_failed.connect(self._on_conversion_failed)
+        worker.signals.conversion_cancelled.connect(
+            self._on_conversion_cancelled
+        )
+        worker.signals.conversion_needs_reselect.connect(
+            self._on_conversion_needs_reselect
+        )
+        pool = QThreadPool.globalInstance()
+        if pool is None:
+            log.warning(
+                "_on_download_completed: no global QThreadPool for id=%s",
+                download_id,
+            )
+            return
+        pool.start(worker)
+        log.info("ConversionWorker enqueued: id=%s", download_id)
+
+    def _on_conversion_progress(
+        self, download_id: str, percent: float
+    ) -> None:
+        self.conversion_progress.emit(download_id, percent)
+
+    def _on_conversion_finished(
+        self, download_id: str, output_path: str
+    ) -> None:
+        self.conversion_finished.emit(download_id, output_path)
+
+    def _on_conversion_failed(self, download_id: str, message: str) -> None:
+        self.conversion_failed.emit(download_id, message)
+
+    def _on_conversion_cancelled(self, download_id: str) -> None:
+        self.conversion_cancelled.emit(download_id)
+
+    def _on_conversion_needs_reselect(
+        self, download_id: str, max_res: str
+    ) -> None:
+        self.conversion_needs_reselect.emit(download_id, max_res)
 
