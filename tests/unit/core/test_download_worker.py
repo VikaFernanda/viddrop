@@ -34,6 +34,7 @@ class StubQueueManager:
         self.completed: list[str] = []
         self.errors: list[tuple[str, str]] = []
         self.progress: list[tuple[str, int]] = []
+        self.output_paths: list[tuple[str, str]] = []
 
     def get_entry(self, download_id: str) -> StubEntry:
         if download_id != self._entry.id:
@@ -48,6 +49,9 @@ class StubQueueManager:
 
     def update_progress(self, download_id: str, percent: int) -> None:
         self.progress.append((download_id, percent))
+
+    def set_output_path(self, download_id: str, file_path: str) -> None:
+        self.output_paths.append((download_id, file_path))
 
 
 class FakeDownloader:
@@ -96,6 +100,17 @@ def test_run_calls_start_and_marks_complete(entry):
     assert fake.start_args["dest_path"] == entry.destination_path
     assert qm.completed == [entry.id]
     assert qm.errors == []
+
+
+def test_run_stores_output_path_before_marking_complete(entry):
+    qm = StubQueueManager(entry)
+    fake = FakeDownloader()
+    DownloadWorker(entry.id, qm, downloader=fake).run()
+
+    # set_output_path must be called with the resolved file path returned by Downloader.start()
+    assert qm.output_paths == [(entry.id, f"{entry.destination_path}/out.mp4")]
+    # and it must happen before mark_complete
+    assert qm.completed == [entry.id]
 
 
 # ----------------------------------------------------------------------- #
